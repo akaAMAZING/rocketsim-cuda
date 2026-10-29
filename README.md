@@ -45,25 +45,22 @@ copies game state through the CPU, and every arena steps exactly as RocketSim wo
 
 ## Speed
 
-Arena-ticks per second (one arena advanced one tick at 120 Hz), RTX 3080 against a Ryzen 9 5900X, both on the same idle
-machine. GPU: the 8-tick decision kernel, median of 20 launches, on a mixed set of states sampled from play (kickoffs,
-pinches, goal-mouth scrambles, demos, car-ball contact, wall and ceiling play, free flight, ground driving). CPU: stock
-RocketSim V3 `4572287`, release build, on its own scenario set.
+The simulator on its own, RTX 3080: the 8-tick decision kernel on 567 start states sampled from V3 play (kickoffs, open
+play, head-on drives, corner pinches, boost-pad contention), median of 20 launches on an idle machine:
 
-| | arena-ticks/s |
+| Arenas | Arena-ticks/s |
 |---|---|
-| GPU, 65,536 arenas | **4.89 M** (best launch 5.0 M) |
-| GPU, 16,384 arenas | 4.38 M |
-| GPU, 4,096 arenas | 2.26 M |
-| CPU, 1 thread | 0.56 M |
-| CPU, 24 threads (all cores) | 4.73 M |
+| 16,384 | 4.10 M |
+| 65,536 | **4.42 M** |
 
-Read it plainly: on an RTX 3080 the GPU steps about as fast as a whole 12-core desktop CPU, or about nine CPU cores. The
-point is where the state lives, not raw tick speed: the arenas sit in GPU memory beside the policy, so a GPU training loop
-never copies observations and controls through the host, and the CPU stays free. Cost per tick depends on the state:
-contact (pinches, car-car, the ball against the goal frame) is the most expensive, and quiet states such as a kickoff
-approach run several times faster (the example below reports about 31 M arena-ticks/s on its 16,384 kickoffs). Larger
-cards have more SMs; we have not measured them.
+Cost per tick depends on the state: contact (pinches, car-car, the ball against the goal frame) is the most expensive, and
+quiet states run several times faster (the kickoff example reports about 31 M arena-ticks/s).
+
+In a full training loop that keeps everything on the same RTX 3080 (simulation, observations, policy inference and PPO
+updates, with no copies through the CPU), we train at about **480,000 steps per second**, one step being one 8-tick
+decision of one car. The networks are MLPs with three hidden layers of 512: a policy with 176 inputs and 90 discrete actions
+(RLGym's action table), about 0.68 M parameters, and a critic of the same shape (a 120-bin value head). The training loop
+is not part of this repository.
 
 ## Accuracy
 
