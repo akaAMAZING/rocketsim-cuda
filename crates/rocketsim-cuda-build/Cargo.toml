@@ -1,0 +1,9 @@
+[package]
+name = "rocketsim-cuda-build"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Build-script helper: compiles the CUDA kernel groups under cuda/ into fat binaries with nvcc"
+
+[dependencies]
+cc = "1"

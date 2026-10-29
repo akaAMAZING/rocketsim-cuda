@@ -1,0 +1,21 @@
+[package]
+name = "rocketsim-cuda"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "A bit-exact CUDA port of RocketSim V3 (1v1 Soccar): one thread simulates one arena"
+
+[dependencies]
+# Driver API loaded at run time; `nvrtc` only for its module-image type (no run-time compilation is used).
+cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13020"] }
+
+[build-dependencies]
+rocketsim-cuda-build = { path = "../rocketsim-cuda-build" }
+cc = "1"
+
+[dev-dependencies]
+# the patched V3 (v3/fetch_v3.sh) with the phase harness, and the scenario machinery that supplies the start states
+rocketsim = { path = "../../vendor/rocketsim-4572287/rocketsim", features = ["trace"] }
+v3dump = { path = "../../v3/v3dump" }
+# The reference: V3's own vector math, built without the `fma` target feature (asserted in the tests).
+glam = "=0.34.1"

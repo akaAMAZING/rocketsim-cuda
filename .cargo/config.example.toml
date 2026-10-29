@@ -1,0 +1,8 @@
+# Copy to .cargo/config.toml (machine-local, gitignored).
+[env]
+# The CUDA toolkit root (the directory holding bin/nvcc); CUDA 13.2 or newer. Without it nvcc is looked up on the PATH.
+CUDA_HOME = "/usr/local/cuda"
+# Compute capabilities to build for, e.g. "86" or "86,120". Without it the GPUs nvidia-smi reports are used.
+ROCKETSIM_CUDA_ARCHS = "86"
+# Directory holding the Soccar collision meshes (soccar/*.cmf), needed by the tests and the example.
+# ROCKETSIM_MESHES = "/path/to/collision_meshes"

@@ -1,0 +1,11 @@
+[package]
+name = "v3dump"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Completeness tests for the rocketsim-dump patch: export, import and compare V3's full per-arena state"
+
+[dependencies]
+# the fetched, patched V3 (run v3/fetch_v3.sh first); not crates.io
+rocketsim = { path = "../../vendor/rocketsim-4572287/rocketsim", features = ["trace"] }

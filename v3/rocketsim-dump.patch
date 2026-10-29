@@ -1,0 +1,1895 @@
+diff --git a/rocketsim/Cargo.toml b/rocketsim/Cargo.toml
+index 5f2d03b..203a90e 100644
+--- a/rocketsim/Cargo.toml
++++ b/rocketsim/Cargo.toml
+@@ -23,6 +23,9 @@ serde = { version = "1", features = ["derive"], optional = true }
+ 
+ [features]
+ default = []
++dump = []
++# Phase harness: Arena::step_phase(k) runs one phase of step_tick
++trace = ["dump"]
+ serde = ["dep:serde", "glam/serde"]
+ 
+ [lints.clippy]
+diff --git a/rocketsim/src/bullet/collision/broadphase/axis_sweep.rs b/rocketsim/src/bullet/collision/broadphase/axis_sweep.rs
+index ef1462a..89c4c6a 100644
+--- a/rocketsim/src/bullet/collision/broadphase/axis_sweep.rs
++++ b/rocketsim/src/bullet/collision/broadphase/axis_sweep.rs
+@@ -494,3 +494,47 @@ impl AxisSweep3 {
+         }
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl AxisSweep3 {
++    /// State dump of the sweep-and-prune state: handles, edge arrays, free list and the pair cache.
++    pub(super) fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        use crate::dump::{seq, seq_u16};
++        seq(io, &mut self.handles, BroadphaseProxy::default, |io, h| {
++            io.u32(&mut h.client_obj_idx);
++            io.u8(&mut h.collision_filter_group);
++            io.u8(&mut h.collision_filter_mask);
++            io.u32(&mut h.unique_id);
++            io.aabb(&mut h.aabb);
++            io.u32(&mut h.cell_idx);
++            for i in &mut h.indices {
++                io.u32(i);
++            }
++        });
++        seq(io, &mut self.handle_edges, HandleEdges::default, |io, e| {
++            for v in e.min.iter_mut().chain(e.max.iter_mut()) {
++                io.u16(v);
++            }
++        });
++        for axis in &mut self.edges {
++            seq(io, axis, Edge::default, |io, e| {
++                io.u16(&mut e.pos);
++                io.u16(&mut e.handle);
++            });
++        }
++        io.u16(&mut self.num_handles);
++        seq_u16(io, &mut self.free_list);
++        io.u16(&mut self.next_new_handle);
++        self.pair_cache.dump_io(io);
++    }
++
++    /// State dump of the constants.
++    pub(super) fn dump_static(&self, w: &mut crate::dump::Wr) {
++        w.put_vec3(self.world_aabb_min);
++        w.put_vec3(self.quantize);
++        w.put_u16(AXIS_SWEEP_HANDLE_MASK);
++        w.put_u16(AXIS_SWEEP_SENTINEL);
++        w.put_u16(AXIS_SWEEP_MAX_HANDLES);
++        w.put_f32(AXIS_SWEEP_WORLD_HALF_EXTENT);
++    }
++}
+diff --git a/rocketsim/src/bullet/collision/broadphase/grid_broadphase.rs b/rocketsim/src/bullet/collision/broadphase/grid_broadphase.rs
+index beb5814..5fccb8d 100644
+--- a/rocketsim/src/bullet/collision/broadphase/grid_broadphase.rs
++++ b/rocketsim/src/bullet/collision/broadphase/grid_broadphase.rs
+@@ -425,3 +425,125 @@ impl GridBroadphase {
+         }
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl GridBroadphase {
++    /// State dump of the broadphase: the dynamic ray-cell lists (order matters for the ray candidate order, empty
++    /// cells are omitted) and the sweep-and-prune state. `island_dynamic_pairs` is derived scratch.
++    pub(crate) fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        let mut cells: Vec<(usize, Vec<usize>)> = self
++            .cell_grid
++            .cells
++            .iter()
++            .enumerate()
++            .filter(|(_, c)| !c.dyn_handles.is_empty())
++            .map(|(i, c)| (i, c.dyn_handles.clone()))
++            .collect();
++        crate::dump::seq(
++            io,
++            &mut cells,
++            || (0, Vec::new()),
++            |io, (i, handles)| {
++                io.idx(i);
++                crate::dump::seq_idx(io, handles);
++            },
++        );
++        if I::READ {
++            for c in self.cell_grid.cells.iter_mut() {
++                c.dyn_handles.clear();
++            }
++            for (i, handles) in cells {
++                self.cell_grid.cells[i].dyn_handles = handles;
++            }
++        }
++        self.axis_sweep.dump_io(io);
++    }
++
++    /// State dump of the broadphase constants (world section) and the static ray-cell lists (cell section).
++    pub(crate) fn dump_static(
++        &self,
++        world: &mut crate::dump::Wr,
++        cells: &mut crate::dump::Wr,
++    ) -> [u32; 2] {
++        let g = &self.cell_grid;
++        world.put_vec3(g.min_pos);
++        world.put_vec3(g.max_pos);
++        world.put_f32(g.cell_size);
++        world.put_f32(g.cell_size_sq);
++        world.put_idx(g.num_cells.x);
++        world.put_idx(g.num_cells.y);
++        world.put_idx(g.num_cells.z);
++        self.axis_sweep.dump_static(world);
++
++        let occupied: Vec<_> = g
++            .cells
++            .iter()
++            .enumerate()
++            .filter(|(_, c)| !c.static_handles.is_empty())
++            .collect();
++        cells.put_idx(occupied.len());
++        let mut entries = 0;
++        for (i, c) in occupied {
++            cells.put_idx(i);
++            cells.put_idx(c.static_handles.len());
++            for &h in &c.static_handles {
++                cells.put_idx(h);
++            }
++            entries += c.static_handles.len();
++        }
++        [g.cells.len() as u32, entries as u32]
++    }
++}
++
++#[cfg(feature = "dump")]
++impl GridBroadphase {
++    /// The constant part of every sweep-and-prune proxy: `u32 n`, then per handle (index 0 is the sentinel)
++    /// client body, filter group and mask, unique id, box, cell and cell indices. A dynamic body's box and cells move
++    /// every tick and are written as zero; a static body's never change.
++    pub(crate) fn dump_proxies(&self, w: &mut crate::dump::Wr) {
++        let handles = self.axis_sweep.handles();
++        w.put_u32(handles.len() as u32);
++        for p in handles {
++            let is_static = p.collision_filter_group & CollisionFilterGroups::Static as u8 != 0;
++            w.put_u32(p.client_obj_idx);
++            w.put_u8(p.collision_filter_group);
++            w.put_u8(p.collision_filter_mask);
++            w.put_u32(p.unique_id);
++            if is_static {
++                w.put_aabb(&p.aabb);
++                w.put_u32(p.cell_idx);
++                for i in p.indices {
++                    w.put_u32(i);
++                }
++            } else {
++                w.put_aabb(&crate::shared::Aabb::default());
++                w.put_u32(0);
++                for _ in 0..3 {
++                    w.put_u32(0);
++                }
++            }
++        }
++    }
++
++    /// Collision filter group and mask of a proxy.
++    pub(crate) fn dump_filter(&self, handle: usize) -> (u8, u8) {
++        let p = self.axis_sweep.proxy(handle);
++        (p.collision_filter_group, p.collision_filter_mask)
++    }
++}
++
++#[cfg(feature = "dump")]
++impl GridBroadphase {
++    /// Header counts: sweep-and-prune handles, retained pairs, dynamic ray-cell entries.
++    pub(crate) fn dump_counts(&self) -> [u32; 3] {
++        [
++            self.axis_sweep.handles().len() as u32,
++            self.axis_sweep.retained_pairs().len() as u32,
++            self.cell_grid
++                .cells
++                .iter()
++                .map(|c| c.dyn_handles.len() as u32)
++                .sum(),
++        ]
++    }
++}
+diff --git a/rocketsim/src/bullet/collision/broadphase/overlapping_pair_cache.rs b/rocketsim/src/bullet/collision/broadphase/overlapping_pair_cache.rs
+index 9618da8..52564c9 100644
+--- a/rocketsim/src/bullet/collision/broadphase/overlapping_pair_cache.rs
++++ b/rocketsim/src/bullet/collision/broadphase/overlapping_pair_cache.rs
+@@ -159,3 +159,23 @@ impl OverlappingPairCache {
+         }
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl OverlappingPairCache {
++    /// State dump of the retained pair array (order matters) and the triangular pair index table.
++    pub(super) fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        crate::dump::seq(
++            io,
++            &mut self.overlapping_pair_array,
++            || BroadphasePair {
++                proxy0: 0,
++                proxy1: 0,
++            },
++            |io, p| {
++                io.idx(&mut p.proxy0);
++                io.idx(&mut p.proxy1);
++            },
++        );
++        crate::dump::seq_u32(io, &mut self.pair_indices);
++    }
++}
+diff --git a/rocketsim/src/bullet/collision/dispatch/collision_dispatcher.rs b/rocketsim/src/bullet/collision/dispatch/collision_dispatcher.rs
+index d370f8b..b6db176 100644
+--- a/rocketsim/src/bullet/collision/dispatch/collision_dispatcher.rs
++++ b/rocketsim/src/bullet/collision/dispatch/collision_dispatcher.rs
+@@ -824,3 +824,28 @@ impl CollisionDispatcher {
+         pair_cache.process_all_overlapping_pairs(collision_objs, self, contact_added_callback);
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl CollisionDispatcher {
++    /// State dump of the persistent manifolds, the active-manifold order and the dense manifold table.
++    /// `raw_body_aabbs` and `compound_child_aabbs` are per-dispatch scratch, rebuilt by `prepare_dispatch_bounds`.
++    pub(crate) fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        use crate::dump::{seq, seq_idx, seq_u32};
++        seq(
++            io,
++            &mut self.persistent_manifolds,
++            || PersistentManifold::new_empty(),
++            |io, m| m.dump_io(io),
++        );
++        seq_idx(io, &mut self.active_manifolds);
++        io.idx(&mut self.manifold_stride);
++        seq_u32(io, &mut self.manifold_table);
++    }
++}
++
++#[cfg(feature = "dump")]
++impl CollisionDispatcher {
++    pub(crate) fn dump_table_len(&self) -> usize {
++        self.manifold_table.len()
++    }
++}
+diff --git a/rocketsim/src/bullet/collision/narrowphase/persistent_manifold.rs b/rocketsim/src/bullet/collision/narrowphase/persistent_manifold.rs
+index 568f96b..409e63d 100644
+--- a/rocketsim/src/bullet/collision/narrowphase/persistent_manifold.rs
++++ b/rocketsim/src/bullet/collision/narrowphase/persistent_manifold.rs
+@@ -329,3 +329,44 @@ impl PersistentManifold {
+         }
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl PersistentManifold {
++    /// State dump of one retained manifold: the four point slots are always present, in cache order.
++    pub(crate) fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        io.idx(&mut self.body0_idx);
++        io.idx(&mut self.body1_idx);
++        io.u64(&mut self.pair_key);
++        io.f32(&mut self.contact_breaking_threshold);
++        io.f32(&mut self.contact_processing_threshold);
++        let mut n = self.point_cache.len() as u32;
++        io.u32(&mut n);
++        if I::READ {
++            self.point_cache.clear();
++            for _ in 0..(n as usize).min(MANIFOLD_CACHE_SIZE) {
++                self.point_cache.push(ManifoldPoint::default());
++            }
++        }
++        for i in 0..MANIFOLD_CACHE_SIZE {
++            let mut p = self.point_cache.get(i).copied().unwrap_or_default();
++            crate::dump::io_manifold_point(io, &mut p);
++            if I::READ && i < self.point_cache.len() {
++                self.point_cache[i] = p;
++            }
++        }
++    }
++}
++
++#[cfg(feature = "dump")]
++impl PersistentManifold {
++    pub(crate) fn new_empty() -> Self {
++        Self {
++            point_cache: ArrayVec::new(),
++            body0_idx: 0,
++            body1_idx: 0,
++            pair_key: 0,
++            contact_breaking_threshold: 0.0,
++            contact_processing_threshold: 0.0,
++        }
++    }
++}
+diff --git a/rocketsim/src/bullet/collision/shapes/bvh_triangle_mesh_shape.rs b/rocketsim/src/bullet/collision/shapes/bvh_triangle_mesh_shape.rs
+index 0aca993..bc9387e 100644
+--- a/rocketsim/src/bullet/collision/shapes/bvh_triangle_mesh_shape.rs
++++ b/rocketsim/src/bullet/collision/shapes/bvh_triangle_mesh_shape.rs
+@@ -68,3 +68,31 @@ impl BvhTriangleMeshShape {
+             .report_quad_ray_overlapping_node(&mut my_node_callback, ray_info);
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl BvhTriangleMeshShape {
++    /// State dump of one mesh: triangles in index order, the built BVH, the triangle info map.
++    /// `counts` receives the totals of wide nodes, leaves and triangle infos.
++    pub(crate) fn dump_static(&self, w: &mut crate::dump::Wr, counts: &mut [u32]) {
++        w.put_aabb(&self.aabb_ident_cache);
++        let tris = self.mesh_interface.get_tris();
++        w.put_idx(tris.len());
++        for t in tris {
++            for p in t.points {
++                w.put_vec3(p);
++            }
++            w.put_vec3(t.normal);
++        }
++        let [nodes, leaves] = self.bvh.dump_static(w);
++        counts[4] += nodes as u32;
++        counts[5] += leaves as u32;
++        w.put_idx(self.triangle_info_map.len());
++        counts[6] += self.triangle_info_map.len() as u32;
++        for info in self.triangle_info_map.iter() {
++            w.put_u8(info.flags);
++            w.put_f32(info.edge_v0_v1_angle);
++            w.put_f32(info.edge_v1_v2_angle);
++            w.put_f32(info.edge_v2_v0_angle);
++        }
++    }
++}
+diff --git a/rocketsim/src/bullet/collision/shapes/static_plane_shape.rs b/rocketsim/src/bullet/collision/shapes/static_plane_shape.rs
+index 9343132..3052c63 100644
+--- a/rocketsim/src/bullet/collision/shapes/static_plane_shape.rs
++++ b/rocketsim/src/bullet/collision/shapes/static_plane_shape.rs
+@@ -154,3 +154,16 @@ impl StaticPlaneShape {
+         }
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl StaticPlaneShape {
++    /// State dump of one plane; its position is the body's translation.
++    pub(crate) fn dump_static(&self, w: &mut crate::dump::Wr) {
++        w.put_vec3(self.plane_normal);
++        w.put_u8(u8::from(self.is_single_axis));
++        w.put_idx(self.single_axis_idx);
++        w.put_u8(u8::from(self.single_axis_backwards));
++        w.put_aabb(&self.aabb_ident_cache);
++        w.put_aabb(&self.aabb_cache);
++    }
++}
+diff --git a/rocketsim/src/bullet/dynamics/constraint_solver/seq_impulse_constraint_solver.rs b/rocketsim/src/bullet/dynamics/constraint_solver/seq_impulse_constraint_solver.rs
+index 8bada0d..f08a4d3 100644
+--- a/rocketsim/src/bullet/dynamics/constraint_solver/seq_impulse_constraint_solver.rs
++++ b/rocketsim/src/bullet/dynamics/constraint_solver/seq_impulse_constraint_solver.rs
+@@ -86,6 +86,8 @@ pub struct SeqImpulseConstraintSolver {
+     tmp_split_should_run: Vec<bool>,
+     /// Ball-only arenas do not need split rows for separated special points.
+     pub skip_separated_special_rows: bool,
++    #[cfg(feature = "dump")]
++    pub dump_stats: crate::dump::SolverStats,
+ }
+ 
+ impl Default for SeqImpulseConstraintSolver {
+@@ -99,6 +101,8 @@ impl Default for SeqImpulseConstraintSolver {
+             tmp_special_accumulators: Vec::new(),
+             tmp_split_should_run: Vec::new(),
+             skip_separated_special_rows: false,
++            #[cfg(feature = "dump")]
++            dump_stats: crate::dump::SolverStats::default(),
+         }
+     }
+ }
+@@ -148,6 +152,17 @@ impl SeqImpulseConstraintSolver {
+         active_manifold_idcs: &mut Vec<usize>,
+         time_step: f32,
+     ) {
++        #[cfg(feature = "dump")]
++        {
++            let stats = &mut self.dump_stats;
++            stats.max_live_manifolds = stats.max_live_manifolds.max(manifolds.len());
++            stats.max_active_manifolds = stats.max_active_manifolds.max(active_manifold_idcs.len());
++            let points: usize = active_manifold_idcs
++                .iter()
++                .map(|&i| manifolds[i].point_cache.len())
++                .sum();
++            stats.max_active_points = stats.max_active_points.max(points);
++        }
+         self.solve_group_setup(
+             collision_objs,
+             non_static_bodies,
+@@ -155,6 +170,17 @@ impl SeqImpulseConstraintSolver {
+             active_manifold_idcs,
+             time_step,
+         );
++        #[cfg(feature = "dump")]
++        {
++            let stats = &mut self.dump_stats;
++            stats.max_contact_rows = stats
++                .max_contact_rows
++                .max(self.tmp_solver_contact_constraint_pool.len());
++            stats.max_friction_rows = stats
++                .max_friction_rows
++                .max(self.tmp_solver_contact_friction_constraint_pool.len());
++            stats.max_solver_bodies = stats.max_solver_bodies.max(self.tmp_solver_body_pool.len());
++        }
+         self.solve_group_iterations();
+         self.solve_group_finish(collision_objs, time_step);
+     }
+diff --git a/rocketsim/src/bullet/dynamics/discrete_dynamics_world.rs b/rocketsim/src/bullet/dynamics/discrete_dynamics_world.rs
+index 57aa0c7..5b01eae 100644
+--- a/rocketsim/src/bullet/dynamics/discrete_dynamics_world.rs
++++ b/rocketsim/src/bullet/dynamics/discrete_dynamics_world.rs
+@@ -303,3 +303,164 @@ impl DiscreteDynamicsWorld {
+         self.internal_single_step_simulation(time_step, contact_added_callback);
+     }
+ }
++
++#[cfg(feature = "trace")]
++impl DiscreteDynamicsWorld {
++    /// P2: `step_simulation` up to and including `predict_unconstraint_motion`.
++    pub(crate) fn trace_p2(&mut self, time_step: f32) {
++        self.apply_gravity(time_step);
++        self.predict_unconstraint_motion(time_step);
++    }
++
++    /// P3a: the first half of `perform_discrete_collision_detection` (AABB update and sweep-and-prune).
++    pub(crate) fn trace_p3a(&mut self) {
++        self.collision_world.update_aabbs();
++    }
++
++    /// P3b: the second half of `perform_discrete_collision_detection` (narrowphase in pair order).
++    pub(crate) fn trace_p3b<T: ContactAddedCallback>(&mut self, contact_added_callback: &mut T) {
++        let cw = &mut self.collision_world;
++        cw.dispatcher1.dispatch_all_collision_pairs(
++            &cw.collision_objs,
++            &mut cw.broadphase_pair_cache,
++            contact_added_callback,
++        );
++    }
++
++    /// P4: `sort_manifolds` (island union-find over the retained dynamic pairs, the sleep of bodies that want
++    /// deactivation in islands without an active body, then the manifold sort).
++    pub(crate) fn trace_p4(&mut self) {
++        let dynamic_pairs = self
++            .collision_world
++            .broadphase_pair_cache
++            .overlapping_dynamic_body_pairs();
++        self.island_manager.sort_manifolds(
++            &mut self.collision_world.collision_objs,
++            &self.dynamic_body_idcs,
++            dynamic_pairs,
++            &self.collision_world.dispatcher1.persistent_manifolds,
++            &mut self.collision_world.dispatcher1.active_manifolds,
++        );
++    }
++
++    /// P5: the solver (`solve_group`).
++    pub(crate) fn trace_p5(&mut self, time_step: f32) {
++        let ball_only = self.ball_only
++            && self.dynamic_body_idcs.len() == 1
++            && self.collision_world.collision_objs[self.dynamic_body_idcs[0]].user_idx
++                == UserInfoType::Ball;
++        self.solver.skip_separated_special_rows = ball_only;
++        self.solve_constraints(time_step);
++    }
++
++    /// P6: `integrate_trans` and `update_activation_state`.
++    pub(crate) fn trace_p6(&mut self, time_step: f32) {
++        self.integrate_trans(time_step);
++        self.update_activation_state(time_step);
++    }
++}
++
++#[cfg(feature = "dump")]
++impl DiscreteDynamicsWorld {
++    /// State dump of the world's mutable state: bodies, dispatcher, broadphase, island manager.
++    /// The constraint solver keeps no state across ticks: its pools are cleared at the end of every solve and its
++    /// `fixed_body_id`, `companion_id` links and residual are reassigned before they are read.
++    pub(crate) fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        use crate::dump::tag;
++        io.tag(tag(b"BODY"));
++        let n = io.len(self.collision_world.collision_objs.len());
++        assert_eq!(
++            n,
++            self.collision_world.collision_objs.len(),
++            "dump: body count"
++        );
++        for body in &mut self.collision_world.collision_objs {
++            body.dump_io(io);
++        }
++        io.tag(tag(b"DISP"));
++        self.collision_world.dispatcher1.dump_io(io);
++        io.tag(tag(b"BROA"));
++        self.collision_world.broadphase_pair_cache.dump_io(io);
++        io.tag(tag(b"ISLD"));
++        self.island_manager.dump_io(io);
++        io.bool(&mut self.ball_only);
++    }
++
++    /// State dump of the world constants and the static bodies' collision data.
++    pub(crate) fn dump_static(&self, s: &mut crate::dump::StaticSections, full: bool) {
++        use crate::bullet::collision::shapes::collision_shape::CollisionShapes;
++        let c = &mut s.counts;
++        s.world.put_vec3(self.gravity);
++        s.world.put_idx(self.dynamic_body_idcs.len());
++        for &i in &self.dynamic_body_idcs {
++            s.world.put_idx(i);
++        }
++        let broadphase = &self.collision_world.broadphase_pair_cache;
++        let [n_cells, entries] = broadphase.dump_static(&mut s.world, &mut s.cells);
++        c[10] = n_cells;
++        c[11] = entries;
++
++        let bodies = &self.collision_world.collision_objs;
++        c[0] = bodies.len() as u32;
++        c[1] = self.dynamic_body_idcs.len() as u32;
++        s.bodies.put_idx(bodies.len());
++        for (i, body) in bodies.iter().enumerate() {
++            let (group, mask) = broadphase.dump_filter(body.get_broadphase_handle());
++            body.dump_static(&mut s.bodies, group, mask);
++            match body.get_collision_shape() {
++                CollisionShapes::TriangleMesh(mesh) => {
++                    c[2] += 1;
++                    c[3] += mesh.get_mesh_interface().get_total_num_faces() as u32;
++                    s.bodies
++                        .put_idx(mesh.get_mesh_interface().get_total_num_faces());
++                    if full {
++                        s.meshes.put_idx(i);
++                        mesh.dump_static(&mut s.meshes, c);
++                    }
++                }
++                CollisionShapes::StaticPlane(plane) => {
++                    c[7] += 1;
++                    s.planes.put_idx(i);
++                    plane.dump_static(&mut s.planes);
++                }
++                _ => {}
++            }
++        }
++    }
++
++    /// The static broadphase proxies, after the pads.
++    pub(crate) fn dump_proxies(&self, w: &mut crate::dump::Wr) {
++        self.collision_world.broadphase_pair_cache.dump_proxies(w);
++    }
++
++    pub(crate) fn dump_stats(&self) -> crate::dump::SolverStats {
++        self.solver.dump_stats
++    }
++
++    pub(crate) fn reset_dump_stats(&mut self) {
++        self.solver.dump_stats = Default::default();
++    }
++}
++
++#[cfg(feature = "dump")]
++impl DiscreteDynamicsWorld {
++    /// Header counts of the world: bodies, retained manifolds, active manifolds, manifold points, manifold table
++    /// length, sweep-and-prune handles, retained pairs, dynamic ray-cell entries.
++    pub(crate) fn dump_counts(&self) -> [u32; 8] {
++        let d = &self.collision_world.dispatcher1;
++        let [handles, pairs, cells] = self.collision_world.broadphase_pair_cache.dump_counts();
++        [
++            self.collision_world.collision_objs.len() as u32,
++            d.persistent_manifolds.len() as u32,
++            d.active_manifolds.len() as u32,
++            d.persistent_manifolds
++                .iter()
++                .map(|m| m.point_cache.len() as u32)
++                .sum(),
++            d.dump_table_len() as u32,
++            handles,
++            pairs,
++            cells,
++        ]
++    }
++}
+diff --git a/rocketsim/src/bullet/dynamics/rigid_body.rs b/rocketsim/src/bullet/dynamics/rigid_body.rs
+index 30d7932..10fb1e7 100644
+--- a/rocketsim/src/bullet/dynamics/rigid_body.rs
++++ b/rocketsim/src/bullet/dynamics/rigid_body.rs
+@@ -552,3 +552,89 @@ impl RigidBody {
+         }
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl RigidBody {
++    /// The activation state's code in the dump: 0 active, 1 sleeping, 2 simulation disabled, 3 wants deactivation.
++    pub(crate) const fn activation_code(&self) -> u8 {
++        match self.activation {
++            ActivationState::Active => 0,
++            ActivationState::Sleeping => 1,
++            ActivationState::DisableSimulation => 2,
++            ActivationState::WantsDeactivation => 3,
++        }
++    }
++
++    /// State dump of the fields Bullet keeps between steps.
++    pub(crate) fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        io.u8(&mut self.collision_flags);
++        crate::dump::opt_idx(io, &mut self.companion_id);
++        let mut activation = self.activation_code();
++        io.u8(&mut activation);
++        self.activation = match activation {
++            1 => ActivationState::Sleeping,
++            2 => ActivationState::DisableSimulation,
++            3 => ActivationState::WantsDeactivation,
++            _ => ActivationState::Active,
++        };
++        io.aff3(&mut self.world_trans);
++        io.quat(&mut self.world_quat);
++        io.aff3(&mut self.interp_world_trans);
++        io.f32(&mut self.deactivation_time);
++        io.vec3(&mut self.lin_vel);
++        io.vec3(&mut self.ang_vel);
++        io.mat3(&mut self.inv_inertia_tensor_world);
++        io.vec3(&mut self.accum_lin_vel);
++        io.vec3(&mut self.accum_ang_vel);
++        io.f32(&mut self.cached_linear_damping);
++        io.f32(&mut self.cached_damping_time_step);
++        io.f32(&mut self.cached_linear_damping_value);
++    }
++
++    /// State dump of the construction constants of this body; `group` and `mask` come from its proxy.
++    /// `collision_flags` is state (a demolished car sets NoContactResponse), see `dump_io`.
++    pub(crate) fn dump_static(&self, w: &mut crate::dump::Wr, group: u8, mask: u8) {
++        w.put_idx(self.world_array_idx);
++        w.put_u8(self.user_idx as u8);
++        w.put_idx(self.user_pointer);
++        w.put_idx(self.broadphase_handle);
++        w.put_u8(group);
++        w.put_u8(mask);
++        w.put_f32(self.mass);
++        w.put_f32(self.inv_mass);
++        w.put_vec3(self.inv_inertia_local);
++        w.put_vec3(self.inv_mass_splat);
++        w.put_f32(self.friction);
++        w.put_f32(self.restitution);
++        w.put_f32(self.contact_processing_threshold);
++        w.put_f32(self.contact_breaking_threshold);
++        w.put_f32(self.linear_damping);
++        w.put_f32(self.linear_sleeping_threshold);
++        w.put_f32(self.angular_sleeping_threshold);
++        // static bodies never move: their pose is a constant (dynamic bodies carry identity here)
++        if self.is_static_obj() {
++            w.put_aff3(&self.world_trans);
++        } else {
++            w.put_aff3(&Affine3A::IDENTITY);
++        }
++        match &self.shape {
++            CollisionShapes::TriangleMesh(_) => w.put_u8(0),
++            CollisionShapes::StaticPlane(_) => w.put_u8(1),
++            CollisionShapes::Sphere(s) => {
++                w.put_u8(2);
++                w.put_vec3(s.convex_internal_shape.implicit_dim);
++                w.put_f32(s.convex_internal_shape.margin);
++            }
++            CollisionShapes::Compound(c) => {
++                w.put_u8(3);
++                w.put_vec3(c.child_shape.get_half_extents());
++                w.put_f32(c.child_shape.get_margin());
++                w.put_aff3(&c.child_trans);
++                w.put_aabb(c.get_ident_aabb());
++            }
++            CollisionShapes::ConvexHull(_) | CollisionShapes::Triangle(_) => {
++                panic!("dump: shape kind not used by Soccar")
++            }
++        }
++    }
++}
+diff --git a/rocketsim/src/bullet/dynamics/simulation_island_manager.rs b/rocketsim/src/bullet/dynamics/simulation_island_manager.rs
+index 12ba512..d43f4ab 100644
+--- a/rocketsim/src/bullet/dynamics/simulation_island_manager.rs
++++ b/rocketsim/src/bullet/dynamics/simulation_island_manager.rs
+@@ -245,3 +245,34 @@ fn hoare_sort(indices: &mut [usize], keys: &[isize]) {
+         sort(indices, keys, 0, indices.len() - 1);
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl SimulationIslandManager {
++    /// State dump of the island manager: the union-find scratch and the sort cache.
++    /// The cache is a memo of the sort and never changes a result; it is exported so that two arenas compare equal.
++    /// `island_has_active_body` is not: `sort_manifolds` resizes and clears it before every read.
++    pub(super) fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        use crate::dump::{seq, seq_idx};
++        seq_idx(io, &mut self.body_to_dynamic);
++        seq_idx(io, &mut self.parents);
++        seq(io, &mut self.island_tags, || 0, |io, x| io_isize(io, x));
++        seq(io, &mut self.sort_keys, || 0, |io, x| io_isize(io, x));
++        for cache in [&mut self.cached_input, &mut self.cached_output] {
++            let mut v: Vec<usize> = cache.iter().copied().collect();
++            seq_idx(io, &mut v);
++            if I::READ {
++                cache.clear();
++                cache
++                    .try_extend_from_slice(&v)
++                    .expect("cache over capacity");
++            }
++        }
++    }
++}
++
++#[cfg(feature = "dump")]
++fn io_isize<I: crate::dump::Io>(io: &mut I, v: &mut isize) {
++    let mut x = *v as i64;
++    io.i64(&mut x);
++    *v = x as isize;
++}
+diff --git a/rocketsim/src/bullet/dynamics/vehicle/wheel_info.rs b/rocketsim/src/bullet/dynamics/vehicle/wheel_info.rs
+index 1ba8366..7b89f3c 100644
+--- a/rocketsim/src/bullet/dynamics/vehicle/wheel_info.rs
++++ b/rocketsim/src/bullet/dynamics/vehicle/wheel_info.rs
+@@ -350,3 +350,48 @@ impl WheelInfo {
+         );
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl WheelInfo {
++    /// State dump of the wheel's cached state: the raycast record and the per-tick values.
++    /// The suspension parameters (`chassis_connection_point_cs`, `suspension_rest_length_1`, `wheels_radius`,
++    /// `suspension_force_scale`, `real_ray_length`) are constants of the car body and live in the static dump.
++    pub(crate) fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        use crate::dump::{opt, opt_vec3};
++        opt(
++            io,
++            &mut self.raycast_info,
++            || RaycastInfo {
++                contact_normal: Vec3A::ZERO,
++                contact_point: Vec3A::ZERO,
++                ground_body_idx: 0,
++                suspension_length: 0.0,
++                impulse: Vec3A::ZERO,
++                ground_stick: None,
++                is_in_contact_with_world: false,
++                clipped_inv_contact_dot_suspension: 0.0,
++                suspension_relative_vel: 0.0,
++            },
++            |io, r| {
++                io.vec3(&mut r.contact_normal);
++                io.vec3(&mut r.contact_point);
++                io.idx(&mut r.ground_body_idx);
++                io.f32(&mut r.suspension_length);
++                io.vec3(&mut r.impulse);
++                opt_vec3(io, &mut r.ground_stick);
++                io.bool(&mut r.is_in_contact_with_world);
++                io.f32(&mut r.clipped_inv_contact_dot_suspension);
++                io.f32(&mut r.suspension_relative_vel);
++            },
++        );
++        io.vec3(&mut self.hard_point);
++        io.vec3(&mut self.axle_dir);
++        io.f32(&mut self.engine_force);
++        io.f32(&mut self.brake);
++        io.f32(&mut self.steer_angle);
++        io.vec3(&mut self.vel_at_contact_point);
++        io.f32(&mut self.lat_friction);
++        io.f32(&mut self.long_friction);
++        io.f32(&mut self.extra_pushback);
++    }
++}
+diff --git b/rocketsim/src/dump.rs b/rocketsim/src/dump.rs
+new file mode 100644
+index 0000000..e33b94d
+--- /dev/null
++++ b/rocketsim/src/dump.rs
+@@ -0,0 +1,555 @@
++//! State dump (feature `dump`, added by the `rocketsim-dump` patch): the flat little-endian export and import of every piece
++//! of per-arena mutable state that persists across ticks, and the export of the static collision data.
++//! The format is the traversal in this file: the header counts, then each piece in `dump_io` order.
++//!
++//! One traversal serves both directions: every `dump_io` takes `&mut self` and an [`Io`], and either writes the fields
++//! out ([`Wr`]) or reads them back in ([`Rd`]), so the write order and the read order cannot differ.
++
++use glam::{Affine3A, Mat3A, Quat, Vec3A};
++
++use crate::{
++    BoostPad, Car, CarControls, CarState, RaycastHitInfo, UserInfoType,
++    bullet::collision::narrowphase::manifold_point::ManifoldPoint, shared::Aabb,
++};
++
++pub const ARENA_MAGIC: [u8; 8] = *b"V3ARENA\0";
++pub const STATIC_MAGIC: [u8; 8] = *b"V3STATIC";
++/// Arena dump version 2 adds each pad's `touching_car_idxs` (V3 0.3.3's pad membership, in arrival order).
++pub const VERSION: u32 = 2;
++/// Static dump version 2 adds the `PROX` section (the static broadphase proxies); version 3 adds `boost_pads_enabled` to `WRLD`
++/// and each car's hitbox size and offset to `CARS` (V3 0.3.3's pad box test).
++pub const STATIC_VERSION: u32 = 3;
++
++/// Section tags (ASCII, little-endian u32), written before each section and checked on read.
++pub const fn tag(t: &[u8; 4]) -> u32 {
++    u32::from_le_bytes(*t)
++}
++
++/// FNV-1a, 64 bit.
++pub fn fnv1a64(bytes: &[u8]) -> u64 {
++    let mut h = 0xcbf2_9ce4_8422_2325u64;
++    for &b in bytes {
++        h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
++    }
++    h
++}
++
++/// Direction-agnostic field codec. `READ` is true when the values are assigned from the stream.
++pub trait Io {
++    const READ: bool;
++    fn u8(&mut self, v: &mut u8);
++    fn u16(&mut self, v: &mut u16);
++    fn u32(&mut self, v: &mut u32);
++    fn u64(&mut self, v: &mut u64);
++    fn f32(&mut self, v: &mut f32);
++
++    fn bool(&mut self, v: &mut bool) {
++        let mut b = u8::from(*v);
++        self.u8(&mut b);
++        *v = b != 0;
++    }
++
++    /// An index as u32; `usize::MAX` (the island manager's "not dynamic") is 0xFFFF_FFFF.
++    fn idx(&mut self, v: &mut usize) {
++        let mut x = if *v == usize::MAX {
++            u32::MAX
++        } else {
++            u32::try_from(*v).expect("index overflows u32")
++        };
++        self.u32(&mut x);
++        *v = if x == u32::MAX {
++            usize::MAX
++        } else {
++            x as usize
++        };
++    }
++
++    fn i8(&mut self, v: &mut i8) {
++        let mut x = *v as u8;
++        self.u8(&mut x);
++        *v = x as i8;
++    }
++
++    fn i64(&mut self, v: &mut i64) {
++        let mut x = *v as u64;
++        self.u64(&mut x);
++        *v = x as i64;
++    }
++
++    /// Section tag: written as is, checked on read.
++    fn tag(&mut self, t: u32) {
++        let mut x = t;
++        self.u32(&mut x);
++        assert_eq!(x, t, "dump section tag mismatch");
++    }
++
++    /// Element count of a sequence: written from `n`, read back (and bounded by the bytes left) on import.
++    fn len(&mut self, n: usize) -> usize {
++        let mut x = n as u32;
++        self.u32(&mut x);
++        x as usize
++    }
++
++    fn vec3(&mut self, v: &mut Vec3A) {
++        self.f32(&mut v.x);
++        self.f32(&mut v.y);
++        self.f32(&mut v.z);
++    }
++
++    fn mat3(&mut self, m: &mut Mat3A) {
++        self.vec3(&mut m.x_axis);
++        self.vec3(&mut m.y_axis);
++        self.vec3(&mut m.z_axis);
++    }
++
++    fn aff3(&mut self, t: &mut Affine3A) {
++        self.mat3(&mut t.matrix3);
++        self.vec3(&mut t.translation);
++    }
++
++    fn quat(&mut self, q: &mut Quat) {
++        self.f32(&mut q.x);
++        self.f32(&mut q.y);
++        self.f32(&mut q.z);
++        self.f32(&mut q.w);
++    }
++
++    fn aabb(&mut self, a: &mut Aabb) {
++        self.vec3(&mut a.min);
++        self.vec3(&mut a.max);
++    }
++}
++
++/// Sequence of `T`: u32 count, then the elements.
++pub fn seq<I: Io, T>(
++    io: &mut I,
++    v: &mut Vec<T>,
++    make: impl Fn() -> T,
++    mut f: impl FnMut(&mut I, &mut T),
++) {
++    let n = io.len(v.len());
++    if I::READ {
++        v.clear();
++        v.resize_with(n, make);
++    }
++    for x in v.iter_mut() {
++        f(io, x);
++    }
++}
++
++/// Sequence of u32 indices (`usize` in memory).
++pub fn seq_idx<I: Io>(io: &mut I, v: &mut Vec<usize>) {
++    seq(io, v, || 0, |io, x| io.idx(x));
++}
++
++/// Sequence of u16.
++pub fn seq_u16<I: Io>(io: &mut I, v: &mut Vec<u16>) {
++    seq(io, v, || 0, |io, x| io.u16(x));
++}
++
++/// Sequence of u32.
++pub fn seq_u32<I: Io>(io: &mut I, v: &mut Vec<u32>) {
++    seq(io, v, || 0, |io, x| io.u32(x));
++}
++
++/// Optional value: u8 flag, then the payload always occupies its full size (zeros when absent).
++pub fn opt<I: Io, T>(
++    io: &mut I,
++    v: &mut Option<T>,
++    make: impl Fn() -> T,
++    f: impl FnOnce(&mut I, &mut T),
++) {
++    let mut some = v.is_some();
++    io.bool(&mut some);
++    let mut tmp = if I::READ {
++        make()
++    } else {
++        v.take().unwrap_or_else(make)
++    };
++    f(io, &mut tmp);
++    *v = some.then_some(tmp);
++}
++
++pub fn opt_idx<I: Io>(io: &mut I, v: &mut Option<usize>) {
++    opt(io, v, || 0, |io, x| io.idx(x));
++}
++
++pub fn opt_u64<I: Io>(io: &mut I, v: &mut Option<u64>) {
++    opt(io, v, || 0, |io, x| io.u64(x));
++}
++
++pub fn opt_vec3<I: Io>(io: &mut I, v: &mut Option<Vec3A>) {
++    opt(io, v, || Vec3A::ZERO, |io, x| io.vec3(x));
++}
++
++/// Writer.
++#[derive(Default)]
++pub struct Wr(pub Vec<u8>);
++
++impl Wr {
++    pub fn put_u8(&mut self, v: u8) {
++        self.0.push(v);
++    }
++    pub fn put_u16(&mut self, v: u16) {
++        self.0.extend_from_slice(&v.to_le_bytes());
++    }
++    pub fn put_u32(&mut self, v: u32) {
++        self.0.extend_from_slice(&v.to_le_bytes());
++    }
++    pub fn put_u64(&mut self, v: u64) {
++        self.0.extend_from_slice(&v.to_le_bytes());
++    }
++    pub fn put_f32(&mut self, v: f32) {
++        self.0.extend_from_slice(&v.to_bits().to_le_bytes());
++    }
++    pub fn put_idx(&mut self, v: usize) {
++        self.put_u32(if v == usize::MAX {
++            u32::MAX
++        } else {
++            u32::try_from(v).expect("index overflows u32")
++        });
++    }
++    pub fn put_vec3(&mut self, v: Vec3A) {
++        self.put_f32(v.x);
++        self.put_f32(v.y);
++        self.put_f32(v.z);
++    }
++    pub fn put_mat3(&mut self, m: Mat3A) {
++        self.put_vec3(m.x_axis);
++        self.put_vec3(m.y_axis);
++        self.put_vec3(m.z_axis);
++    }
++    pub fn put_aff3(&mut self, t: &Affine3A) {
++        self.put_mat3(t.matrix3);
++        self.put_vec3(t.translation);
++    }
++    pub fn put_aabb(&mut self, a: &Aabb) {
++        self.put_vec3(a.min);
++        self.put_vec3(a.max);
++    }
++}
++
++impl Io for Wr {
++    const READ: bool = false;
++    fn u8(&mut self, v: &mut u8) {
++        self.put_u8(*v);
++    }
++    fn u16(&mut self, v: &mut u16) {
++        self.put_u16(*v);
++    }
++    fn u32(&mut self, v: &mut u32) {
++        self.put_u32(*v);
++    }
++    fn u64(&mut self, v: &mut u64) {
++        self.put_u64(*v);
++    }
++    fn f32(&mut self, v: &mut f32) {
++        self.put_f32(*v);
++    }
++}
++
++/// Reader over a byte slice. A short read records an error, returns zero and the caller reports it at the end.
++pub struct Rd<'a> {
++    buf: &'a [u8],
++    pos: usize,
++    pub err: Option<&'static str>,
++}
++
++impl<'a> Rd<'a> {
++    pub const fn new(buf: &'a [u8]) -> Self {
++        Self {
++            buf,
++            pos: 0,
++            err: None,
++        }
++    }
++
++    pub const fn remaining(&self) -> usize {
++        self.buf.len() - self.pos
++    }
++
++    fn take<const N: usize>(&mut self) -> [u8; N] {
++        if self.remaining() < N {
++            self.err = Some("dump truncated");
++            self.pos = self.buf.len();
++            return [0; N];
++        }
++        let mut out = [0u8; N];
++        out.copy_from_slice(&self.buf[self.pos..self.pos + N]);
++        self.pos += N;
++        out
++    }
++}
++
++impl Io for Rd<'_> {
++    const READ: bool = true;
++    fn u8(&mut self, v: &mut u8) {
++        *v = self.take::<1>()[0];
++    }
++    fn u16(&mut self, v: &mut u16) {
++        *v = u16::from_le_bytes(self.take());
++    }
++    fn u32(&mut self, v: &mut u32) {
++        *v = u32::from_le_bytes(self.take());
++    }
++    fn u64(&mut self, v: &mut u64) {
++        *v = u64::from_le_bytes(self.take());
++    }
++    fn f32(&mut self, v: &mut f32) {
++        *v = f32::from_bits(u32::from_le_bytes(self.take()));
++    }
++    fn len(&mut self, _n: usize) -> usize {
++        let mut x = 0u32;
++        self.u32(&mut x);
++        if x as usize > self.remaining() {
++            // every element takes at least one byte
++            self.err = Some("dump count exceeds the bytes left");
++            return 0;
++        }
++        x as usize
++    }
++}
++
++/// Counts in the arena dump header (also a checksum of the structure read back).
++pub const ARENA_COUNTS: usize = 12;
++
++/// Per-arena mutable state, as a flat little-endian byte stream.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ArenaDump(pub Vec<u8>);
++
++impl ArenaDump {
++    pub const HEADER_LEN: usize = 8 + 4 + 8 + 4 * ARENA_COUNTS;
++
++    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
++        if bytes.len() < Self::HEADER_LEN || bytes[..8] != ARENA_MAGIC {
++            return Err("not an arena dump (magic)".into());
++        }
++        if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != VERSION {
++            return Err("unsupported arena dump version".into());
++        }
++        Ok(Self(bytes))
++    }
++
++    pub fn as_bytes(&self) -> &[u8] {
++        &self.0
++    }
++
++    /// Hash of the static configuration the dump was taken from (header field).
++    pub fn config_hash(&self) -> u64 {
++        u64::from_le_bytes(self.0[12..20].try_into().unwrap())
++    }
++
++    pub fn counts(&self) -> [u32; ARENA_COUNTS] {
++        std::array::from_fn(|i| {
++            let o = 20 + 4 * i;
++            u32::from_le_bytes(self.0[o..o + 4].try_into().unwrap())
++        })
++    }
++}
++
++/// Static collision data and configuration constants, as a flat little-endian byte stream.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct StaticDump(pub Vec<u8>);
++
++pub const STATIC_COUNTS: usize = 12;
++
++impl StaticDump {
++    pub const HEADER_LEN: usize = 8 + 4 + 8 + 8 + 4 * STATIC_COUNTS;
++
++    /// Checks magic, version, the payload length and the payload hash.
++    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
++        if bytes.len() < Self::HEADER_LEN || bytes[..8] != STATIC_MAGIC {
++            return Err("not a static dump (magic)".into());
++        }
++        if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != STATIC_VERSION {
++            return Err("unsupported static dump version".into());
++        }
++        let d = Self(bytes);
++        if d.payload_len() != d.0.len() - Self::HEADER_LEN {
++            return Err("static dump payload length mismatch".into());
++        }
++        if fnv1a64(&d.0[Self::HEADER_LEN..]) != d.hash() {
++            return Err("static dump payload hash mismatch".into());
++        }
++        Ok(d)
++    }
++
++    pub fn as_bytes(&self) -> &[u8] {
++        &self.0
++    }
++
++    pub fn hash(&self) -> u64 {
++        u64::from_le_bytes(self.0[12..20].try_into().unwrap())
++    }
++
++    pub fn payload_len(&self) -> usize {
++        u64::from_le_bytes(self.0[20..28].try_into().unwrap()) as usize
++    }
++
++    pub fn counts(&self) -> [u32; STATIC_COUNTS] {
++        std::array::from_fn(|i| {
++            let o = 28 + 4 * i;
++            u32::from_le_bytes(self.0[o..o + 4].try_into().unwrap())
++        })
++    }
++}
++
++/// Largest sizes seen while stepping, for sizing the GPU pools. Reset with `Arena::reset_dump_stats`.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct SolverStats {
++    /// Retained manifolds (the persistent pool) when the solver ran.
++    pub max_live_manifolds: usize,
++    /// Manifolds that took part in a solve (contacts this tick).
++    pub max_active_manifolds: usize,
++    /// Manifold points over the active manifolds.
++    pub max_active_points: usize,
++    /// Normal rows of one solve: contact rows, split-only rows and the synthetic ball-world rows.
++    pub max_contact_rows: usize,
++    /// Friction rows of one solve.
++    pub max_friction_rows: usize,
++    /// Solver bodies of one solve (dynamic bodies plus the fixed body).
++    pub max_solver_bodies: usize,
++}
++
++// -- Car, ball, pad state (all fields reachable from the crate) --
++
++fn io_controls<I: Io>(io: &mut I, c: &mut CarControls) {
++    io.f32(&mut c.throttle);
++    io.f32(&mut c.steer);
++    io.f32(&mut c.pitch);
++    io.f32(&mut c.yaw);
++    io.f32(&mut c.roll);
++    io.bool(&mut c.jump);
++    io.bool(&mut c.boost);
++    io.bool(&mut c.handbrake);
++}
++
++fn io_user_info<I: Io>(io: &mut I, u: &mut UserInfoType) {
++    let mut x = *u as u8;
++    io.u8(&mut x);
++    *u = match x {
++        1 => UserInfoType::Car,
++        2 => UserInfoType::Ball,
++        3 => UserInfoType::DropshotTile,
++        _ => UserInfoType::None,
++    };
++}
++
++fn io_hit<I: Io>(io: &mut I, h: &mut RaycastHitInfo) {
++    io.vec3(&mut h.hit_point);
++    io.vec3(&mut h.hit_normal);
++    io.f32(&mut h.hit_fraction);
++    io_user_info(io, &mut h.user_info);
++}
++
++pub fn io_manifold_point<I: Io>(io: &mut I, p: &mut ManifoldPoint) {
++    io.vec3(&mut p.local_point_a);
++    io.vec3(&mut p.local_point_b);
++    io.vec3(&mut p.pos_world_on_b);
++    io.vec3(&mut p.pos_world_on_a);
++    io.vec3(&mut p.normal_world_on_b);
++    io.f32(&mut p.distance_1);
++    io.f32(&mut p.combined_friction);
++    io.f32(&mut p.combined_restitution);
++    io.f32(&mut p.applied_impulse);
++    io.bool(&mut p.is_special);
++}
++
++fn io_car_state<I: Io>(io: &mut I, s: &mut CarState) {
++    io.vec3(&mut s.phys.pos);
++    io.mat3(&mut s.phys.rot_mat);
++    io.vec3(&mut s.phys.vel);
++    io.vec3(&mut s.phys.ang_vel);
++    io_controls(io, &mut s.controls);
++    io.bool(&mut s.has_jumped);
++    io.bool(&mut s.has_double_jumped);
++    io.bool(&mut s.has_flipped);
++    io.vec3(&mut s.flip_rel_torque);
++    io.u32(&mut s.jump_ticks);
++    io.f32(&mut s.flip_time);
++    io.bool(&mut s.is_flipping);
++    io.bool(&mut s.is_jumping);
++    io.bool(&mut s.jump_hold_broken);
++    io.f32(&mut s.air_time);
++    io.f32(&mut s.air_time_since_jump);
++    io.f32(&mut s.boost);
++    io.f32(&mut s.handbrake_val);
++    io.bool(&mut s.is_supersonic);
++    io.f32(&mut s.supersonic_grace_timer);
++    io.f32(&mut s.time_since_boosted);
++    io.f32(&mut s.boosting_time);
++    io.bool(&mut s.is_boosting);
++    io.bool(&mut s.is_auto_flipping);
++    io.f32(&mut s.auto_flip_timer);
++    io.f32(&mut s.auto_flip_torque_scale);
++    io.f32(&mut s.bump_cooldown_timer);
++    opt_idx(io, &mut s.bump_cooldown_victim);
++    opt_u64(io, &mut s.last_extra_hit_tick);
++    io.bool(&mut s.is_demoed);
++    io.f32(&mut s.demo_respawn_timer);
++    io.bool(&mut s.cache.is_on_ground);
++    for h in &mut s.cache.wheels_with_contact {
++        opt(
++            io,
++            h,
++            || RaycastHitInfo {
++                hit_point: Vec3A::ZERO,
++                hit_normal: Vec3A::ZERO,
++                hit_fraction: 0.0,
++                user_info: UserInfoType::None,
++            },
++            io_hit,
++        );
++    }
++    opt_vec3(io, &mut s.cache.world_contact_normal);
++    io_controls(io, &mut s.cache.prev_controls);
++}
++
++pub fn io_car<I: Io>(io: &mut I, c: &mut Car) {
++    io.f32(&mut c.info.config.dodge_deadzone);
++    io.vec3(&mut c.vel_impulse_cache);
++    io.bool(&mut c.sticky_gate_prev);
++    io_car_state(io, &mut c.state);
++    for w in &mut c.bullet_vehicle.wheels {
++        w.dump_io(io);
++    }
++}
++
++pub(crate) fn io_pad<I: Io>(io: &mut I, p: &mut BoostPad) {
++    let mut last = p.gave_boost_tick_count;
++    opt(io, &mut last, || 0, |io, x| io.i64(x));
++    p.gave_boost_tick_count = last;
++    // The grid's `winners` and `touching_pad_by_car` are scratch: update_membership refills both before any read.
++    seq_idx(io, &mut p.touching_car_idxs);
++}
++
++pub(crate) fn io_ball<I: Io>(io: &mut I, b: &mut crate::Ball) {
++    let s = &mut b.state;
++    io.vec3(&mut s.phys.pos);
++    io.mat3(&mut s.phys.rot_mat);
++    io.vec3(&mut s.phys.vel);
++    io.vec3(&mut s.phys.ang_vel);
++    io.i8(&mut s.hs_info.y_target_dir);
++    io.f32(&mut s.hs_info.cur_target_speed);
++    io.f32(&mut s.hs_info.time_since_hit);
++    io.u8(&mut s.ds_info.charge_level);
++    io.f32(&mut s.ds_info.accumulated_hit_force);
++    io.i8(&mut s.ds_info.y_target_dir);
++    opt_u64(io, &mut s.ds_info.last_damage_tick);
++    io.u64(&mut s.tick_count_since_kickoff);
++    io.bool(&mut b.ground_stick_applied);
++}
++
++/// The static sections while they are built; `counts` is the header count block.
++#[derive(Default)]
++pub struct StaticSections {
++    pub world: Wr,
++    pub bodies: Wr,
++    pub meshes: Wr,
++    pub planes: Wr,
++    pub cells: Wr,
++    pub cars: Wr,
++    pub pads: Wr,
++    pub proxies: Wr,
++    pub counts: [u32; STATIC_COUNTS],
++}
+diff --git a/rocketsim/src/lib.rs b/rocketsim/src/lib.rs
+index 41bcd72..ff47e72 100644
+--- a/rocketsim/src/lib.rs
++++ b/rocketsim/src/lib.rs
+@@ -46,6 +46,8 @@
+ 
+ mod base;
+ mod bullet;
++#[cfg(feature = "dump")]
++pub mod dump;
+ mod glam_inc;
+ mod logging;
+ pub mod shared;
+diff --git a/rocketsim/src/shared/bvh.rs b/rocketsim/src/shared/bvh.rs
+index cfbfaae..e18d829 100644
+--- a/rocketsim/src/shared/bvh.rs
++++ b/rocketsim/src/shared/bvh.rs
+@@ -541,3 +541,31 @@ impl Node {
+         node_type: BvhNodeType::Leaf { leaf_idx: 0 },
+     };
+ }
++
++#[cfg(feature = "dump")]
++impl Tree {
++    /// State dump of the built 4-wide tree, nodes and leaves in storage order.
++    /// Returns the node and leaf counts.
++    pub fn dump_static(&self, w: &mut crate::dump::Wr) -> [usize; 2] {
++        w.put_aabb(&self.aabb);
++        w.put_idx(self.wide_nodes.len());
++        for n in self.wide_nodes.iter() {
++            for v in [n.min_x, n.min_y, n.min_z, n.max_x, n.max_y, n.max_z] {
++                for l in v.to_array() {
++                    w.put_f32(l);
++                }
++            }
++            for c in n.children {
++                w.put_u32(c.0);
++            }
++            w.put_u8(n.child_count);
++            w.put_u32(n.valid_mask);
++        }
++        w.put_idx(self.leaves.len());
++        for l in self.leaves.iter() {
++            w.put_aabb(&l.bounds);
++            w.put_idx(l.leaf_idx);
++        }
++        [self.wide_nodes.len(), self.leaves.len()]
++    }
++}
+diff --git a/rocketsim/src/sim/arena/arena_contact_tracker.rs b/rocketsim/src/sim/arena/arena_contact_tracker.rs
+index 9ce555f..2822a8f 100644
+--- a/rocketsim/src/sim/arena/arena_contact_tracker.rs
++++ b/rocketsim/src/sim/arena/arena_contact_tracker.rs
+@@ -171,3 +171,42 @@ impl ContactAddedCallback for ArenaContactTracker {
+         });
+     }
+ }
++
++#[cfg(feature = "dump")]
++impl ArenaContactTracker {
++    /// State dump of the contact records and their order. Both lists are empty between ticks.
++    pub(crate) fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        use crate::dump::{io_manifold_point, seq};
++        seq(
++            io,
++            &mut self.collision_records,
++            || ContactRecord {
++                is_swap: false,
++                rb_idx_a: 0,
++                rb_idx_b: 0,
++                manifold_point: ManifoldPoint::default(),
++            },
++            |io, r| {
++                io.bool(&mut r.is_swap);
++                io.idx(&mut r.rb_idx_a);
++                io.idx(&mut r.rb_idx_b);
++                io_manifold_point(io, &mut r.manifold_point);
++            },
++        );
++        seq(
++            io,
++            &mut self.ball_world_records,
++            || BallWorldContactRecord {
++                rb_idx: 0,
++                contact_point: glam::Vec3A::ZERO,
++                contact_normal: glam::Vec3A::ZERO,
++            },
++            |io, r| {
++                io.idx(&mut r.rb_idx);
++                io.vec3(&mut r.contact_point);
++                io.vec3(&mut r.contact_normal);
++            },
++        );
++        io.bool(&mut self.ball_only);
++    }
++}
+diff --git a/rocketsim/src/sim/arena/base.rs b/rocketsim/src/sim/arena/base.rs
+index cba16fa..d7069de 100644
+--- a/rocketsim/src/sim/arena/base.rs
++++ b/rocketsim/src/sim/arena/base.rs
+@@ -1986,3 +1986,457 @@ impl Arena {
+         }
+     }
+ }
++
++/// Phase-split `step_tick` (feature `trace`). Boundary `k` is the state before phase `k`
++/// (boundary 0 = the start of a tick, boundary [`PHASES`] = the end of it). Running phases `0..PHASES` in order is
++/// `step_tick`; `step_tick` itself is untouched, so the two stay independent witnesses of each other.
++#[cfg(feature = "trace")]
++pub const PHASES: usize = 10;
++
++/// Phase names by index: P0, P1, P2, P3a, P3b, P4, P5, P6, P7, P8.
++#[cfg(feature = "trace")]
++pub const PHASE_NAMES: [&str; PHASES] = ["P0", "P1", "P2", "P3a", "P3b", "P4", "P5", "P6", "P7", "P8"];
++
++#[cfg(feature = "trace")]
++impl Arena {
++    /// Runs phase `k` (0..PHASES) of the tick. Same statements, same order as `step_tick`; the cuts are marked.
++    pub fn step_phase(&mut self, k: usize) {
++        match k {
++            // P0: clear forces; limit_vels and quantize for cars and ball
++            0 => {
++                self.events.clear();
++                self.bullet_world.clear_accum_forces();
++                {
++                    use consts::{ball, car};
++
++                    if !self.ball_only {
++                        for car_idx in 0..self.cars.len() {
++                            let car_rb = &mut self.bullet_world.bodies_mut()
++                                [self.cars[car_idx].rigid_body_idx];
++                            car_rb.limit_vels(car::MAX_SPEED * UU_TO_BT, car::MAX_ANG_SPEED);
++                            quantize::quantize(car_rb);
++                            self.cars[car_idx].state.phys.vel = car_rb.lin_vel * BT_TO_UU;
++                            self.cars[car_idx].state.phys.ang_vel = car_rb.ang_vel;
++                        }
++                    }
++                    let ball_rb = &mut self.bullet_world.bodies_mut()[self.ball.rigid_body_idx];
++                    ball_rb.limit_vels(
++                        self.config.mutators.ball_max_speed * UU_TO_BT,
++                        ball::MAX_ANG_SPEED,
++                    );
++                    quantize::quantize(ball_rb);
++                    self.ball.state.phys.vel = ball_rb.lin_vel * BT_TO_UU;
++                    self.ball.state.phys.ang_vel = ball_rb.ang_vel;
++                }
++            }
++            // P1: flip z-damp prepass; car pre_tick_update in index order; ball pre_tick_update; ball_only flags
++            1 => {
++                if !self.ball_only {
++                    for car in &mut self.cars {
++                        car.apply_flip_zdamp_prepass(&mut self.bullet_world);
++                    }
++
++                    for car_idx in 0..self.cars.len() {
++                        let was_on_ground = self.cars[car_idx].state.cache.is_on_ground;
++                        self.cars[car_idx].pre_tick_update(
++                            &mut self.bullet_world,
++                            &mut self.rng,
++                            self.config.game_mode,
++                            &self.config.mutators,
++                        );
++                        if !was_on_ground && self.cars[car_idx].state.cache.is_on_ground {
++                            self.events.push(ArenaEvent::CarLanded(CarLandedEvent {
++                                car_idx,
++                                wheels: self.cars[car_idx].state.cache.wheels_with_contact,
++                            }));
++                        }
++                    }
++                }
++
++                self.ball.pre_tick_update(
++                    &mut self.bullet_world.bodies_mut()[self.ball.rigid_body_idx],
++                    self.config.game_mode,
++                );
++
++                let ball_only = self.ball_only;
++                self.contact_tracker.set_ball_only(ball_only);
++                self.bullet_world.set_ball_only(ball_only);
++            }
++            // P2: Bullet step_simulation: gravity, predict_unconstraint_motion
++            2 => self.bullet_world.trace_p2(TICK_TIME),
++            // P3a: AABB update and sweep-and-prune
++            3 => self.bullet_world.trace_p3a(),
++            // P3b: narrowphase dispatch in pair order
++            4 => self.bullet_world.trace_p3b(&mut self.contact_tracker),
++            // P4: sort_manifolds
++            5 => self.bullet_world.trace_p4(),
++            // P5: solve_group
++            6 => self.bullet_world.trace_p5(TICK_TIME),
++            // P6: integrate_trans, update_activation_state
++            7 => self.bullet_world.trace_p6(TICK_TIME),
++            // P7: contact post-processing in record order
++            8 => {
++                let ball_only = self.ball_only;
++                if ball_only {
++                    let contact_count = self.contact_tracker.num_ball_world_records();
++                    for idx in 0..contact_count {
++                        let contact = *self.contact_tracker.get_ball_world_record(idx);
++                        self.on_ball_world_collision_parts(
++                            contact.rb_idx,
++                            contact.contact_point,
++                            contact.contact_normal,
++                        );
++                    }
++                } else {
++                    let contact_count = self.contact_tracker.num_records();
++                    for idx in 0..contact_count {
++                        let contact = *self.contact_tracker.get_record(idx);
++
++                        let bodies = self.bullet_world.bodies();
++                        let rb_a = &bodies[contact.rb_idx_a];
++                        let rb_b = &bodies[contact.rb_idx_b];
++                        let user_idx_a = rb_a.user_idx;
++                        let user_idx_b = rb_b.user_idx;
++                        let user_pointer_a = rb_a.user_pointer;
++                        let user_pointer_b = rb_b.user_pointer;
++
++                        match user_idx_a {
++                            UserInfoType::Car => match user_idx_b {
++                                UserInfoType::Ball => {
++                                    self.on_car_ball_collision(
++                                        user_pointer_a,
++                                        &contact.manifold_point,
++                                        contact.is_swap,
++                                    );
++                                }
++                                UserInfoType::Car => {
++                                    self.on_car_car_collision(
++                                        user_pointer_a,
++                                        user_pointer_b,
++                                        &contact.manifold_point,
++                                    );
++                                }
++                                _ => self
++                                    .on_car_world_collision(user_pointer_a, &contact.manifold_point),
++                            },
++                            UserInfoType::Ball => match user_idx_b {
++                                UserInfoType::DropshotTile => {
++                                    self.on_ball_tile_collision(user_pointer_b);
++                                }
++                                UserInfoType::None => {
++                                    self.on_ball_world_collision(
++                                        &contact.manifold_point,
++                                        contact.rb_idx_a,
++                                    );
++                                }
++                                _ => {}
++                            },
++                            _ => {}
++                        }
++                    }
++                }
++
++                self.contact_tracker.clear_records();
++            }
++            // P8: car post_tick_update, finish_physics_tick, pad pickup; ball finish; tick_count += 1
++            9 => {
++                if !self.ball_only {
++                    for car in &mut self.cars {
++                        car.post_tick_update(&mut self.bullet_world);
++                        let rb = &mut self.bullet_world.bodies_mut()[car.rigid_body_idx];
++                        car.finish_physics_tick(rb);
++                    }
++
++                    if self.config.mutators.boost_pads_enabled
++                        && let Some(grid) = self.boost_pad_grid.as_mut()
++                    {
++                        grid.update_membership(&self.cars, self.config.mutators.car_max_boost_amount);
++
++                        for car_idx in 0..self.cars.len() {
++                            let collected = {
++                                let car = &mut self.cars[car_idx];
++                                grid.maybe_give_car_boost(
++                                    &mut car.state,
++                                    &self.config.mutators,
++                                    self.tick_count,
++                                    car_idx,
++                                )
++                            };
++
++                            if let Some(boost_pad_idx) = collected {
++                                self.events.push(CarPickupBoost(CarPickupBoostEvent {
++                                    car_idx,
++                                    boost_pad_idx,
++                                }));
++                                grid.refresh_winner(
++                                    boost_pad_idx,
++                                    &self.cars,
++                                    self.config.mutators.car_max_boost_amount,
++                                );
++                            }
++                        }
++                    }
++                }
++
++                let ball_rb = &mut self.bullet_world.bodies_mut()[self.ball.rigid_body_idx];
++                self.ball.finish_physics_tick(ball_rb);
++
++                if self.config.game_mode == GameMode::Dropshot
++                    && self.ball.state.ds_info.last_damage_tick == Some(self.tick_count)
++                {
++                    self.update_tile_states();
++                }
++
++                self.tick_count += 1;
++            }
++            _ => panic!("step_phase: phase {k} out of range (0..{PHASES})"),
++        }
++    }
++}
++
++#[cfg(feature = "dump")]
++impl Arena {
++    /// Header counts: the world's, then cars, pads and the two contact-record lists.
++    fn dump_counts(&self) -> [u32; crate::dump::ARENA_COUNTS] {
++        let w = self.bullet_world.dump_counts();
++        let pads = self.boost_pad_grid.as_ref();
++        [
++            w[0],
++            w[1],
++            w[2],
++            w[3],
++            w[4],
++            w[5],
++            w[6],
++            w[7],
++            self.cars.len() as u32,
++            pads.map_or(0, |g| g.all_pads.len() as u32),
++            self.contact_tracker.num_records() as u32,
++            self.contact_tracker.num_ball_world_records() as u32,
++        ]
++    }
++
++    fn dump_io<I: crate::dump::Io>(&mut self, io: &mut I) {
++        use crate::dump::{io_ball, io_car, io_pad, tag};
++        assert!(
++            self.tile_states.is_none(),
++            "dump: Dropshot tiles are not exported"
++        );
++        io.tag(tag(b"ARNA"));
++        io.u64(&mut self.tick_count);
++        let mut seed = self.rng.get_seed();
++        io.u64(&mut seed);
++        self.rng.seed(seed);
++        io.bool(&mut self.ball_only);
++        io.tag(tag(b"BALL"));
++        io_ball(io, &mut self.ball);
++        io.tag(tag(b"CARS"));
++        let n = io.len(self.cars.len());
++        assert_eq!(n, self.cars.len(), "dump: car count");
++        for car in &mut self.cars {
++            io_car(io, car);
++        }
++        io.tag(tag(b"PADS"));
++        let mut no_pads = Vec::new();
++        let pads = self
++            .boost_pad_grid
++            .as_mut()
++            .map_or(&mut no_pads, |g| &mut g.all_pads);
++        let n = io.len(pads.len());
++        assert_eq!(n, pads.len(), "dump: pad count");
++        for pad in pads.iter_mut() {
++            io_pad(io, pad);
++        }
++        io.tag(tag(b"CONT"));
++        self.contact_tracker.dump_io(io);
++        self.bullet_world.dump_io(io);
++    }
++
++    /// State dump: every piece of per-arena mutable state that persists across ticks.
++    /// It is exported from a clone, so that one traversal serves export and import. `vis` and the last tick's
++    /// `events` are not state (the events are cleared at the start of every `step_tick`).
++    pub fn export_state(&self) -> crate::dump::ArenaDump {
++        use crate::dump::{ARENA_MAGIC, VERSION, Wr};
++        let mut w = Wr::default();
++        w.0.extend_from_slice(&ARENA_MAGIC);
++        w.put_u32(VERSION);
++        w.put_u64(self.config_hash());
++        for c in self.dump_counts() {
++            w.put_u32(c);
++        }
++        self.clone().dump_io(&mut w);
++        crate::dump::ArenaDump(w.0)
++    }
++
++    /// Restores a dump taken by [`Arena::export_state`] into an arena built from the same config and the same
++    /// loaded meshes (checked through `config_hash`). Replaces all the per-arena state of the dump, so that
++    /// stepping continues bit for bit as the exported arena would have.
++    pub fn import_state(&mut self, dump: &crate::dump::ArenaDump) -> Result<(), String> {
++        use crate::dump::{ArenaDump, Rd};
++        let bytes = dump.as_bytes();
++        let checked = ArenaDump::from_bytes(bytes.to_vec())?;
++        if checked.config_hash() != self.config_hash() {
++            return Err("the dump comes from a different configuration (config_hash)".into());
++        }
++        let mut r = Rd::new(&bytes[ArenaDump::HEADER_LEN..]);
++        self.dump_io(&mut r);
++        if let Some(e) = r.err {
++            return Err(e.into());
++        }
++        if r.remaining() != 0 {
++            return Err(format!("{} trailing bytes", r.remaining()));
++        }
++        if self.dump_counts() != checked.counts() {
++            return Err("header counts do not match the imported structures".into());
++        }
++        self.events.clear();
++        Ok(())
++    }
++
++    /// FNV-1a 64 over the constant sections of the static dump (WRLD, BODY, PLAN, CARS, PADS: everything but the
++    /// meshes and the static ray cells), tags and counts included.
++    pub fn config_hash(&self) -> u64 {
++        let (_, sections) = self.static_sections(false);
++        let mut cfg = Vec::new();
++        for (t, bytes) in &sections {
++            if t != b"MESH" && t != b"CELL" && t != b"PROX" {
++                cfg.extend_from_slice(bytes);
++            }
++        }
++        crate::dump::fnv1a64(&cfg)
++    }
++
++    /// State dump of the static collision data and the configuration constants.
++    pub fn export_static(&self) -> crate::dump::StaticDump {
++        use crate::dump::{STATIC_MAGIC, STATIC_VERSION, Wr, fnv1a64};
++        let (counts, sections) = self.static_sections(true);
++        let payload: Vec<u8> = sections.into_iter().flat_map(|(_, b)| b).collect();
++        let mut w = Wr::default();
++        w.0.extend_from_slice(&STATIC_MAGIC);
++        w.put_u32(STATIC_VERSION);
++        w.put_u64(fnv1a64(&payload));
++        w.put_u64(payload.len() as u64);
++        for c in counts {
++            w.put_u32(c);
++        }
++        w.0.extend_from_slice(&payload);
++        crate::dump::StaticDump(w.0)
++    }
++
++    /// The largest solver sizes seen since the arena was built or the stats were last reset.
++    pub fn dump_stats(&self) -> crate::dump::SolverStats {
++        self.bullet_world.dump_stats()
++    }
++
++    pub fn reset_dump_stats(&mut self) {
++        self.bullet_world.reset_dump_stats();
++    }
++
++    /// The ball body's activation code and deactivation time, for coverage counts of the ball's sleep.
++    pub fn ball_activation(&self) -> (u8, f32) {
++        let rb = &self.bullet_world.bodies()[self.ball.rigid_body_idx];
++        (rb.activation_code(), rb.deactivation_time)
++    }
++
++    /// The static sections (tag, bytes with the tag in front) in file order, and the header counts. With `full`
++    /// false the mesh bodies are skipped (they are what `config_hash` leaves out).
++    fn static_sections(
++        &self,
++        full: bool,
++    ) -> ([u32; crate::dump::STATIC_COUNTS], Vec<([u8; 4], Vec<u8>)>) {
++        use crate::dump::{StaticSections, tag};
++        let mut s = StaticSections::default();
++        let m = &self.config.mutators;
++        s.world.put_u8(self.config.game_mode as u8);
++        s.world.put_u8(u8::from(self.config.no_ball_rot));
++        s.world.put_idx(self.ball.rigid_body_idx);
++        s.world.put_vec3(m.gravity);
++        for f in [
++            m.car_mass,
++            m.ball_mass,
++            m.ball_max_speed,
++            m.ball_drag,
++            m.jump_accel,
++            m.jump_immediate_force,
++            m.boost_accel_ground,
++            m.boost_accel_air,
++            m.boost_used_per_second,
++            m.respawn_delay,
++            m.bump_cooldown_time,
++            m.car_max_boost_amount,
++            m.car_spawn_boost_amount,
++            m.boost_pad_amount_small,
++            m.boost_pad_amount_big,
++            m.boost_pad_cooldown_big,
++            m.boost_pad_cooldown_small,
++            m.ball_hit_extra_force_scale,
++            m.bump_force_scale,
++            m.ball_radius,
++        ] {
++            s.world.put_f32(f);
++        }
++        s.world.put_u8(u8::from(m.unlimited_flips));
++        s.world.put_u8(u8::from(m.unlimited_double_jumps));
++        s.world.put_u8(u8::from(m.recharge_boost_enabled));
++        s.world.put_f32(m.recharge_boost_per_second);
++        s.world.put_f32(m.recharge_boost_delay);
++        s.world.put_u8(m.demo_mode as u8);
++        s.world.put_u8(u8::from(m.enable_team_demos));
++        s.world.put_f32(m.goal_base_threshold_y);
++        s.world.put_u8(u8::from(m.boost_pads_enabled));
++
++        self.bullet_world.dump_static(&mut s, full);
++
++        for car in &self.cars {
++            s.cars.put_idx(car.idx);
++            s.cars.put_u8(car.team as u8);
++            s.cars.put_idx(car.rigid_body_idx);
++            s.cars.put_u8(u8::from(car.config.three_wheels));
++            s.cars.put_vec3(car.config.hitbox_size);
++            s.cars.put_vec3(car.config.hitbox_pos_offset);
++            for w in &car.bullet_vehicle.wheels {
++                s.cars.put_vec3(w.chassis_connection_point_cs);
++                s.cars.put_f32(w.suspension_rest_length_1);
++                s.cars.put_f32(w.wheels_radius);
++                s.cars.put_f32(w.suspension_force_scale);
++                s.cars.put_f32(w.real_ray_length);
++            }
++        }
++        s.counts[8] = self.cars.len() as u32;
++
++        if let Some(grid) = &self.boost_pad_grid {
++            s.pads.put_f32(grid.max_pad_z);
++            for pad in &grid.all_pads {
++                s.pads.put_vec3(pad.config.pos);
++                s.pads.put_u8(u8::from(pad.config.is_big));
++                s.pads.put_f32(pad.box_radius);
++                s.pads.put_f32(pad.cyl_radius);
++                s.pads.put_f32(pad.max_cooldown);
++                s.pads.put_f32(pad.boost_amount);
++                s.pads.put_aabb(&pad.aabb);
++            }
++            s.counts[9] = grid.all_pads.len() as u32;
++        }
++        self.bullet_world.dump_proxies(&mut s.proxies);
++
++        let section = |t: &[u8; 4], n: Option<u32>, body: &[u8]| {
++            let mut sec = tag(t).to_le_bytes().to_vec();
++            if let Some(n) = n {
++                sec.extend_from_slice(&n.to_le_bytes());
++            }
++            sec.extend_from_slice(body);
++            (*t, sec)
++        };
++        let sections = vec![
++            section(b"WRLD", None, &s.world.0),
++            section(b"BODY", None, &s.bodies.0),
++            section(b"MESH", Some(s.counts[2]), &s.meshes.0),
++            section(b"PLAN", Some(s.counts[7]), &s.planes.0),
++            section(b"CELL", None, &s.cells.0),
++            section(b"CARS", Some(s.counts[8]), &s.cars.0),
++            section(b"PADS", Some(s.counts[9]), &s.pads.0),
++            section(b"PROX", None, &s.proxies.0),
++        ];
++        (s.counts, sections)
++    }
++}

@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["crates/rocketsim-cuda", "crates/rocketsim-cuda-build", "v3/v3dump"]
+# the fetched, patched RocketSim V3 (v3/fetch_v3.sh) is its own workspace
+exclude = ["vendor"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+debug = 1
